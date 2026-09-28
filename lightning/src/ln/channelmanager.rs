@@ -3987,6 +3987,43 @@ impl<
 		res
 	}
 
+	/// Runs a short read-only accounting callback while channel state is frozen.
+	/// Returns `None` instead of waiting if any required lock is busy. The callback
+	/// must not call back into this manager or perform blocking/network operations.
+	///
+	/// Each tuple contains public channel details and the exact pre-fee ledger
+	/// allocation to the holder in millisatoshis. Pending outbound HTLCs remain
+	/// encumbered within this allocation until irrevocably resolved; pending inbound
+	/// HTLCs are conditional and must not be added. This is not spendable capacity
+	/// or a prediction of the proceeds from closing the channel.
+	#[cfg(not(c_bindings))]
+	pub fn try_with_accounting_snapshot<AccountingResult>(
+		&self, f: impl FnOnce(BestBlock, Vec<(ChannelDetails, u64)>) -> AccountingResult,
+	) -> Option<AccountingResult> {
+		let _consistency = self.total_consistency_lock.try_write().ok()?;
+		let peers = self.per_peer_state.try_write().ok()?;
+		let best = *self.best_block.try_write().ok()?;
+		let mut peer_guards = Vec::with_capacity(peers.len());
+		for peer in peers.values() {
+			peer_guards.push(peer.try_lock().ok()?);
+		}
+		let mut channels = Vec::new();
+		for peer in &peer_guards {
+			for channel in peer.channel_by_id.values() {
+				channels.push((
+					ChannelDetails::from_channel(
+						channel,
+						best.height,
+						peer.latest_features.clone(),
+						&self.fee_estimator,
+					),
+					channel.funding().get_value_to_self_msat(),
+				));
+			}
+		}
+		Some(f(best, channels))
+	}
+
 	/// Gets the list of usable channels, in random order. Useful as an argument to
 	/// [`Router::find_route`] to ensure non-announced channels are used.
 	///
@@ -9642,7 +9679,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9680,7 +9718,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,

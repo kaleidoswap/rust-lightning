@@ -707,6 +707,32 @@ where
 		}
 	}
 
+	/// Runs a short callback with frozen monitor copies while all source monitors
+	/// remain locked. Returns `None` on contention or unapplied deferred operations.
+	/// The callback must not re-enter the monitor set or perform blocking I/O.
+	#[cfg(not(c_bindings))]
+	pub fn try_with_accounting_snapshot<R>(
+		&self, f: impl FnOnce(Vec<(ChannelId, ChannelMonitor<ChannelSigner>)>) -> R,
+	) -> Option<R>
+	where
+		ChannelSigner: Clone,
+	{
+		let pending = self.pending_ops.try_lock().ok()?;
+		if !pending.is_empty() {
+			return None;
+		}
+		let monitors = self.monitors.try_write().ok()?;
+		let mut guards = Vec::with_capacity(monitors.len());
+		for (id, holder) in monitors.iter() {
+			guards.push((*id, holder.monitor.inner.try_lock().ok()?));
+		}
+		let copies = guards
+			.iter()
+			.map(|(id, inner)| (*id, ChannelMonitor::from_impl((**inner).clone())))
+			.collect();
+		Some(f(copies))
+	}
+
 	/// Lists the funding outpoint and channel ID of each [`ChannelMonitor`] being monitored.
 	///
 	/// Note that [`ChannelMonitor`]s are not removed when a channel is closed as they are always

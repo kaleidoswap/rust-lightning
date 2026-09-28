@@ -1848,7 +1848,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// For lockorder enforcement purposes, we need to have a single site which constructs the
 	/// `inner` mutex, otherwise cases where we lock two monitors at the same time (eg in our
 	/// PartialEq implementation) we may decide a lockorder violation has occurred.
-	fn from_impl(imp: ChannelMonitorImpl<Signer>) -> Self {
+	pub(crate) fn from_impl(imp: ChannelMonitorImpl<Signer>) -> Self {
 		ChannelMonitor { inner: Mutex::new(imp) }
 	}
 
