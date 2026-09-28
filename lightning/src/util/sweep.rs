@@ -470,6 +470,16 @@ where
 		self.sweeper_state.lock().unwrap().outputs.clone()
 	}
 
+	/// Runs a short read-only callback while the complete sweep state is frozen.
+	/// Returns `None` on contention. Do not re-enter the sweeper or block in `f`.
+	#[cfg(not(c_bindings))]
+	pub fn try_with_accounting_snapshot<R>(
+		&self, f: impl FnOnce(BestBlock, Vec<TrackedSpendableOutput>) -> R,
+	) -> Option<R> {
+		let state = self.sweeper_state.try_lock().ok()?;
+		Some(f(state.best_block, state.outputs.clone()))
+	}
+
 	/// Gets the latest best block which was connected either via the [`Listen`] or
 	/// [`Confirm`] interfaces.
 	pub fn current_best_block(&self) -> BestBlock {
