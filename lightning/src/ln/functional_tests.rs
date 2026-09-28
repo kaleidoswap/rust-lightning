@@ -10337,3 +10337,48 @@ fn test_dup_htlc_claim_onchain_and_offchain() {
 	// which calls claim_funds_internal a second time.
 	connect_blocks(&nodes[1], ANTI_REORG_DELAY);
 }
+
+#[test]
+fn accounting_snapshot_preserves_msat_and_conditional_allocations() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let balance = |n: usize| {
+		nodes[n]
+			.node
+			.try_with_accounting_snapshot(|_, channels| {
+				assert_eq!(channels.len(), 1);
+				channels[0].1
+			})
+			.unwrap()
+	};
+	nodes[0]
+		.node
+		.try_with_accounting_snapshot(|_, _| {
+			assert!(nodes[0].node.try_with_accounting_snapshot(|_, _| ()).is_none());
+		})
+		.unwrap();
+	nodes[0]
+		.chain_monitor
+		.chain_monitor
+		.try_with_accounting_snapshot(|copies| {
+			assert_eq!(copies.len(), 1);
+			assert!(nodes[0]
+				.chain_monitor
+				.chain_monitor
+				.try_with_accounting_snapshot(|_| ())
+				.is_none());
+		})
+		.unwrap();
+	let before = [balance(0), balance(1)];
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_001);
+	assert_eq!(balance(0), before[0] - 1_000_001);
+	assert_eq!(balance(1), before[1] + 1_000_001);
+	let settled = [balance(0), balance(1)];
+	let hash = route_payment(&nodes[0], &[&nodes[1]], 2_000_003).1;
+	assert_eq!([balance(0), balance(1)], settled);
+	fail_payment(&nodes[0], &[&nodes[1]], hash);
+	assert_eq!([balance(0), balance(1)], settled);
+}
