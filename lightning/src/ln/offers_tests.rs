@@ -2874,7 +2874,7 @@ fn creates_and_pays_for_offer_for_payment_hash() {
 	let payment_hash = PaymentHash::from(payment_preimage);
 
 	let offer = alice.node
-		.create_offer_builder_for_payment_hash(payment_hash).unwrap()
+		.create_offer_builder_for_payment_hash(payment_hash, None).unwrap()
 		.amount_msats(10_000_000)
 		.build().unwrap();
 	assert!(!offer.paths().is_empty());
@@ -2928,7 +2928,7 @@ fn fails_held_payment_for_offer_for_payment_hash() {
 
 	let payment_hash = PaymentHash::from(PaymentPreimage([7; 32]));
 	let offer = alice.node
-		.create_offer_builder_for_payment_hash(payment_hash).unwrap()
+		.create_offer_builder_for_payment_hash(payment_hash, None).unwrap()
 		.amount_msats(10_000_000)
 		.build().unwrap();
 
@@ -2989,8 +2989,11 @@ fn creates_and_pays_for_refund_for_payment_hash() {
 
 	let payment_preimage = PaymentPreimage([43; 32]);
 	let payment_hash = PaymentHash::from(payment_preimage);
-	let expected_invoice = alice.node.request_refund_payment_for_hash(&refund, payment_hash).unwrap();
+	let expected_invoice = alice.node.request_refund_payment_for_hash(&refund, payment_hash, Some(144)).unwrap();
 	assert_eq!(expected_invoice.payment_hash(), payment_hash);
+	for path in expected_invoice.payment_paths() {
+		assert!(path.payinfo.cltv_expiry_delta >= 144 + 3);
+	}
 
 	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
 	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
@@ -3003,5 +3006,53 @@ fn creates_and_pays_for_refund_for_payment_hash() {
 
 	let purpose = claim_bolt12_payment_for_external_hash(bob, &[alice], payment_preimage, &invoice);
 	assert!(matches!(purpose, PaymentPurpose::Bolt12RefundPayment { .. }));
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+/// Checks that an offer for a payment hash can pin the final CLTV expiry delta, that its invoices
+/// advertise it, and that a payment honouring it is received.
+#[test]
+fn offer_for_payment_hash_pins_min_final_cltv_expiry_delta() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	assert_eq!(
+		alice.node.create_offer_builder_for_payment_hash(PaymentHash([0; 32]), Some(1)).err(),
+		Some(Bolt12SemanticError::InvalidPayInfo)
+	);
+
+	let payment_preimage = PaymentPreimage([44; 32]);
+	let payment_hash = PaymentHash::from(payment_preimage);
+	let offer = alice.node
+		.create_offer_builder_for_payment_hash(payment_hash, Some(144)).unwrap()
+		.amount_msats(10_000_000)
+		.build().unwrap();
+
+	let payment_id = PaymentId([3; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice.payment_hash(), payment_hash);
+	assert!(!invoice.payment_paths().is_empty());
+	for path in invoice.payment_paths() {
+		assert!(path.payinfo.cltv_expiry_delta >= 144 + 3);
+	}
+
+	route_bolt12_payment(bob, &[alice], &invoice);
+	claim_bolt12_payment_for_external_hash(bob, &[alice], payment_preimage, &invoice);
 	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
 }

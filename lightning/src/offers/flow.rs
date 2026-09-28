@@ -324,7 +324,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	fn create_blinded_payment_paths<R: Router>(
 		&self, router: &R, usable_channels: Vec<ChannelDetails>, amount_msats: Option<u64>,
 		payment_secret: PaymentSecret, payment_context: PaymentContext,
-		relative_expiry_seconds: u32,
+		relative_expiry_seconds: u32, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<Vec<BlindedPaymentPath>, ()> {
 		let secp_ctx = &self.secp_ctx;
 		let receive_auth_key = self.receive_auth_key;
@@ -344,14 +344,26 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			payment_context,
 		};
 
-		router.create_blinded_payment_paths(
-			payee_node_id,
-			receive_auth_key,
-			usable_channels,
-			payee_tlvs,
-			amount_msats,
-			secp_ctx,
-		)
+		match min_final_cltv_expiry_delta {
+			Some(min_final_cltv_expiry_delta) => router
+				.create_blinded_payment_paths_with_min_final_cltv_expiry_delta(
+					payee_node_id,
+					receive_auth_key,
+					usable_channels,
+					payee_tlvs,
+					amount_msats,
+					min_final_cltv_expiry_delta,
+					secp_ctx,
+				),
+			None => router.create_blinded_payment_paths(
+				payee_node_id,
+				receive_auth_key,
+				usable_channels,
+				payee_tlvs,
+				amount_msats,
+				secp_ctx,
+			),
+		}
 	}
 
 	#[cfg(test)]
@@ -369,6 +381,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 			payment_secret,
 			payment_context,
 			relative_expiry_seconds,
+			None,
 		)
 	}
 }
@@ -872,6 +885,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				payment_secret,
 				payment_context,
 				relative_expiry_secs,
+				None,
 			)
 			.map_err(|()| Bolt12SemanticError::MissingPaths)?;
 
@@ -917,7 +931,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	pub fn create_invoice_builder_from_refund<'a, ES: EntropySource, R: Router, F>(
 		&'a self, router: &R, entropy_source: ES, refund: &'a Refund,
 		usable_channels: Vec<ChannelDetails>, get_payment_info: F,
-		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>,
+		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<InvoiceBuilder<'a, DerivedSigningPubkey>, Bolt12SemanticError>
 	where
 		F: Fn(u64, u32) -> Result<(PaymentHash, PaymentSecret), Bolt12SemanticError>,
@@ -944,6 +958,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				payment_secret,
 				payment_context,
 				relative_expiry,
+				min_final_cltv_expiry_delta,
 			)
 			.map_err(|_| Bolt12SemanticError::MissingPaths)?;
 
@@ -986,7 +1001,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	pub fn create_invoice_builder_from_invoice_request_with_keys<'a, R: Router, F>(
 		&self, router: &R, invoice_request: &'a VerifiedInvoiceRequest<DerivedSigningPubkey>,
 		usable_channels: Vec<ChannelDetails>, get_payment_info: F,
-		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>,
+		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<(InvoiceBuilder<'a, DerivedSigningPubkey>, MessageContext), Bolt12SemanticError>
 	where
 		F: Fn(u64, u32) -> Result<(PaymentHash, PaymentSecret), Bolt12SemanticError>,
@@ -1012,6 +1027,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				payment_secret,
 				context,
 				relative_expiry,
+				min_final_cltv_expiry_delta,
 			)
 			.map_err(|_| Bolt12SemanticError::MissingPaths)?;
 
@@ -1047,7 +1063,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	pub fn create_invoice_builder_from_invoice_request_without_keys<'a, R: Router, F>(
 		&self, router: &R, invoice_request: &'a VerifiedInvoiceRequest<ExplicitSigningPubkey>,
 		usable_channels: Vec<ChannelDetails>, get_payment_info: F,
-		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>,
+		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<(InvoiceBuilder<'a, ExplicitSigningPubkey>, MessageContext), Bolt12SemanticError>
 	where
 		F: Fn(u64, u32) -> Result<(PaymentHash, PaymentSecret), Bolt12SemanticError>,
@@ -1073,6 +1089,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 				payment_secret,
 				context,
 				relative_expiry,
+				min_final_cltv_expiry_delta,
 			)
 			.map_err(|_| Bolt12SemanticError::MissingPaths)?;
 

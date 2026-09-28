@@ -352,6 +352,24 @@ impl<'a> Router for TestRouter<'a> {
 			Ok(core::mem::take(&mut *expected_paths))
 		}
 	}
+
+	fn create_blinded_payment_paths_with_min_final_cltv_expiry_delta<
+		T: secp256k1::Signing + secp256k1::Verification,
+	>(
+		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey,
+		first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs, amount_msats: Option<u64>,
+		min_final_cltv_expiry_delta: u16, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		self.router.create_blinded_payment_paths_with_min_final_cltv_expiry_delta(
+			recipient,
+			local_node_receive_key,
+			first_hops,
+			tlvs,
+			amount_msats,
+			min_final_cltv_expiry_delta,
+			secp_ctx,
+		)
+	}
 }
 
 impl<'a> Drop for TestRouter<'a> {

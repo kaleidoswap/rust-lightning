@@ -14793,6 +14793,30 @@ impl Default for Bolt11InvoiceParameters {
 /// hash of an offer.
 pub const OFFER_PAYMENT_HASH_METADATA_KEY: u64 = 0x6b616c65;
 
+/// The [`OffersContext::InvoiceRequest::payment_metadata`] key under which
+/// [`ChannelManager::create_offer_builder_for_payment_hash`] stores the offer's minimum final CLTV
+/// expiry delta, as a big-endian `u16`.
+pub const OFFER_MIN_FINAL_CLTV_EXPIRY_DELTA_METADATA_KEY: u64 = 0x6b616c66;
+
+/// Blocks added on top of a requested minimum final CLTV expiry delta when advertising it in
+/// blinded payment paths, allowing for blocks mined while the payment is in flight. Matches the
+/// buffer used for BOLT 11 invoices.
+const MIN_FINAL_CLTV_EXPIRY_DELTA_BUFFER: u16 = 3;
+
+fn check_min_final_cltv_expiry_delta(
+	min_final_cltv_expiry_delta: Option<u16>,
+) -> Result<(), Bolt12SemanticError> {
+	match min_final_cltv_expiry_delta {
+		Some(delta)
+			if delta.saturating_add(MIN_FINAL_CLTV_EXPIRY_DELTA_BUFFER)
+				< MIN_FINAL_CLTV_EXPIRY_DELTA =>
+		{
+			Err(Bolt12SemanticError::InvalidPayInfo)
+		},
+		_ => Ok(()),
+	}
+}
+
 macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	/// Creates an [`OfferBuilder`] such that the [`Offer`] it builds is recognized by the
 	/// [`ChannelManager`] when handling [`InvoiceRequest`] messages for the offer. The offer's
@@ -14836,16 +14860,26 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	///
 	/// The offer may be requested more than once, and all invoices will share the payment hash.
 	///
+	/// If `min_final_cltv_expiry_delta` is set, the invoices' blinded payment paths require the
+	/// final HTLC to expire at least that many blocks out (plus a small buffer), and HTLCs expiring
+	/// sooner are failed. Requires a [`Router`] supporting
+	/// [`Router::create_blinded_payment_paths_with_min_final_cltv_expiry_delta`].
+	///
 	/// [`BlindedMessagePath`]: crate::blinded_path::message::BlindedMessagePath
 	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
 	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
 	/// [`PaymentClaimable`]: events::Event::PaymentClaimable
 	/// [`PaymentPurpose::preimage`]: events::PaymentPurpose::preimage
 	pub fn create_offer_builder_for_payment_hash(
-		&$self, payment_hash: PaymentHash,
+		&$self, payment_hash: PaymentHash, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<$builder, Bolt12SemanticError> {
+		check_min_final_cltv_expiry_delta(min_final_cltv_expiry_delta)?;
 		let mut payment_metadata = BTreeMap::new();
 		payment_metadata.insert(OFFER_PAYMENT_HASH_METADATA_KEY, payment_hash.0.to_vec());
+		if let Some(delta) = min_final_cltv_expiry_delta {
+			payment_metadata
+				.insert(OFFER_MIN_FINAL_CLTV_EXPIRY_DELTA_METADATA_KEY, delta.to_be_bytes().to_vec());
+		}
 		let builder = $self.flow.create_offer_builder_with_payment_metadata(
 			&$self.entropy_source, $self.get_peers_for_blinded_path(), Some(payment_metadata)
 		)?;
@@ -15297,7 +15331,7 @@ impl<
 	pub fn request_refund_payment(
 		&self, refund: &Refund,
 	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
-		self.request_refund_payment_intern(refund, None)
+		self.request_refund_payment_intern(refund, None, None)
 	}
 
 	/// Same as [`Self::request_refund_payment`], but the [`Bolt12Invoice`] commits to the given
@@ -15308,16 +15342,20 @@ impl<
 	/// [`PaymentPurpose::preimage`] and must be claimed via [`Self::claim_funds`] once it is known,
 	/// or failed via [`Self::fail_htlc_backwards`].
 	///
+	/// `min_final_cltv_expiry_delta` behaves as for [`Self::create_offer_builder_for_payment_hash`].
+	///
 	/// [`PaymentClaimable`]: events::Event::PaymentClaimable
 	/// [`PaymentPurpose::preimage`]: events::PaymentPurpose::preimage
 	pub fn request_refund_payment_for_hash(
-		&self, refund: &Refund, payment_hash: PaymentHash,
+		&self, refund: &Refund, payment_hash: PaymentHash, min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
-		self.request_refund_payment_intern(refund, Some(payment_hash))
+		check_min_final_cltv_expiry_delta(min_final_cltv_expiry_delta)?;
+		self.request_refund_payment_intern(refund, Some(payment_hash), min_final_cltv_expiry_delta)
 	}
 
 	fn request_refund_payment_intern(
 		&self, refund: &Refund, external_payment_hash: Option<PaymentHash>,
+		min_final_cltv_expiry_delta: Option<u16>,
 	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
 		let secp_ctx = &self.secp_ctx;
 		let entropy = &self.entropy_source;
@@ -15335,7 +15373,7 @@ impl<
 						payment_hash,
 						Some(amount_msats),
 						relative_expiry,
-						None,
+						min_final_cltv_expiry_delta,
 						None,
 					)
 					.map_err(|()| Bolt12SemanticError::InvalidAmount)
@@ -15346,6 +15384,8 @@ impl<
 					.map(|(hash, secret, _no_metadata)| (hash, secret)),
 			},
 			None,
+			min_final_cltv_expiry_delta
+				.map(|delta| delta.saturating_add(MIN_FINAL_CLTV_EXPIRY_DELTA_BUFFER)),
 		)?;
 
 		let invoice = builder.allow_mpp().build_and_sign(secp_ctx)?;
@@ -17596,13 +17636,26 @@ impl<
 					None => None,
 				};
 
+				let external_min_final_cltv_expiry_delta = match payment_metadata
+					.as_ref()
+					.and_then(|metadata| metadata.get(&OFFER_MIN_FINAL_CLTV_EXPIRY_DELTA_METADATA_KEY))
+				{
+					Some(bytes) => match <[u8; 2]>::try_from(bytes.as_slice()) {
+						Ok(delta) if external_payment_hash.is_some() => Some(u16::from_be_bytes(delta)),
+						_ => return None,
+					},
+					None => None,
+				};
+				let advertised_min_final_cltv_expiry_delta = external_min_final_cltv_expiry_delta
+					.map(|delta| delta.saturating_add(MIN_FINAL_CLTV_EXPIRY_DELTA_BUFFER));
+
 				let get_payment_info = |amount_msats, relative_expiry| match external_payment_hash {
 					Some(payment_hash) => self
 						.create_inbound_payment_for_hash(
 							payment_hash,
 							Some(amount_msats),
 							relative_expiry,
-							None,
+							external_min_final_cltv_expiry_delta,
 							None,
 						)
 						.map_err(|_| Bolt12SemanticError::InvalidAmount)
@@ -17621,6 +17674,7 @@ impl<
 							self.list_usable_channels(),
 							get_payment_info,
 							payment_metadata,
+							advertised_min_final_cltv_expiry_delta,
 						);
 
 						match result {
@@ -17646,6 +17700,7 @@ impl<
 							self.list_usable_channels(),
 							get_payment_info,
 							payment_metadata,
+							advertised_min_final_cltv_expiry_delta,
 						);
 
 						match result {

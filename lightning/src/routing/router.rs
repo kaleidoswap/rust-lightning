@@ -123,12 +123,29 @@ where
 		)
 	}
 
+	fn create_blinded_payment_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey,
+		first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs, amount_msats: Option<u64>,
+		secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		self.create_blinded_payment_paths_with_min_final_cltv_expiry_delta(
+			recipient,
+			local_node_receive_key,
+			first_hops,
+			tlvs,
+			amount_msats,
+			MIN_FINAL_CLTV_EXPIRY_DELTA,
+			secp_ctx,
+		)
+	}
+
 	#[rustfmt::skip]
-	fn create_blinded_payment_paths<
+	fn create_blinded_payment_paths_with_min_final_cltv_expiry_delta<
 		T: secp256k1::Signing + secp256k1::Verification
 	> (
 		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey, first_hops: Vec<ChannelDetails>,
-		tlvs: ReceiveTlvs, amount_msats: Option<u64>, secp_ctx: &Secp256k1<T>
+		tlvs: ReceiveTlvs, amount_msats: Option<u64>, min_final_cltv_expiry_delta: u16,
+		secp_ctx: &Secp256k1<T>
 	) -> Result<Vec<BlindedPaymentPath>, ()> {
 		// Limit the number of blinded paths that are computed.
 		const MAX_PAYMENT_PATHS: usize = 3;
@@ -198,7 +215,7 @@ where
 			.map(|forward_node| {
 				BlindedPaymentPath::new_with_dummy_hops(
 					&[forward_node], recipient, &[DummyTlvs::default(); DEFAULT_PAYMENT_DUMMY_HOPS],
-					local_node_receive_key, tlvs.clone(), u64::MAX, MIN_FINAL_CLTV_EXPIRY_DELTA, &self.entropy_source, secp_ctx
+					local_node_receive_key, tlvs.clone(), u64::MAX, min_final_cltv_expiry_delta, &self.entropy_source, secp_ctx
 				)
 			})
 			.take(MAX_PAYMENT_PATHS)
@@ -210,7 +227,7 @@ where
 				if network_graph.nodes().contains_key(&NodeId::from_pubkey(&recipient)) {
 					BlindedPaymentPath::new_with_dummy_hops(
 						&[], recipient, &[DummyTlvs::default(); DEFAULT_PAYMENT_DUMMY_HOPS],
-						local_node_receive_key, tlvs, u64::MAX, MIN_FINAL_CLTV_EXPIRY_DELTA, &self.entropy_source, secp_ctx
+						local_node_receive_key, tlvs, u64::MAX, min_final_cltv_expiry_delta, &self.entropy_source, secp_ctx
 					).map(|path| vec![path])
 				} else {
 					Err(())
@@ -294,6 +311,32 @@ pub trait Router {
 		first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs, amount_msats: Option<u64>,
 		secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedPaymentPath>, ()>;
+
+	/// Same as [`Self::create_blinded_payment_paths`], but the paths require the final hop's CLTV
+	/// expiry to be at least `min_final_cltv_expiry_delta` blocks out, rather than
+	/// [`MIN_FINAL_CLTV_EXPIRY_DELTA`].
+	///
+	/// The default implementation only supports deltas up to [`MIN_FINAL_CLTV_EXPIRY_DELTA`], as a
+	/// router that does not account for a longer delta would build paths payers underpay.
+	fn create_blinded_payment_paths_with_min_final_cltv_expiry_delta<
+		T: secp256k1::Signing + secp256k1::Verification,
+	>(
+		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey,
+		first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs, amount_msats: Option<u64>,
+		min_final_cltv_expiry_delta: u16, secp_ctx: &Secp256k1<T>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		if min_final_cltv_expiry_delta > MIN_FINAL_CLTV_EXPIRY_DELTA {
+			return Err(());
+		}
+		self.create_blinded_payment_paths(
+			recipient,
+			local_node_receive_key,
+			first_hops,
+			tlvs,
+			amount_msats,
+			secp_ctx,
+		)
+	}
 }
 
 impl<T: Router + ?Sized, R: Deref<Target = T>> Router for R {
@@ -330,6 +373,23 @@ impl<T: Router + ?Sized, R: Deref<Target = T>> Router for R {
 			first_hops,
 			tlvs,
 			amount_msats,
+			secp_ctx,
+		)
+	}
+	fn create_blinded_payment_paths_with_min_final_cltv_expiry_delta<
+		S: secp256k1::Signing + secp256k1::Verification,
+	>(
+		&self, recipient: PublicKey, local_node_receive_key: ReceiveAuthKey,
+		first_hops: Vec<ChannelDetails>, tlvs: ReceiveTlvs, amount_msats: Option<u64>,
+		min_final_cltv_expiry_delta: u16, secp_ctx: &Secp256k1<S>,
+	) -> Result<Vec<BlindedPaymentPath>, ()> {
+		self.deref().create_blinded_payment_paths_with_min_final_cltv_expiry_delta(
+			recipient,
+			local_node_receive_key,
+			first_hops,
+			tlvs,
+			amount_msats,
+			min_final_cltv_expiry_delta,
 			secp_ctx,
 		)
 	}
