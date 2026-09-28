@@ -14788,6 +14788,11 @@ impl Default for Bolt11InvoiceParameters {
 	}
 }
 
+/// The [`OffersContext::InvoiceRequest::payment_metadata`] key under which
+/// [`ChannelManager::create_offer_builder_for_payment_hash`] stores the externally-chosen payment
+/// hash of an offer.
+pub const OFFER_PAYMENT_HASH_METADATA_KEY: u64 = 0x6b616c65;
+
 macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	/// Creates an [`OfferBuilder`] such that the [`Offer`] it builds is recognized by the
 	/// [`ChannelManager`] when handling [`InvoiceRequest`] messages for the offer. The offer's
@@ -14815,6 +14820,34 @@ macro_rules! create_offer_builder { ($self: ident, $builder: ty) => {
 	pub fn create_offer_builder(&$self) -> Result<$builder, Bolt12SemanticError> {
 		let builder = $self.flow.create_offer_builder(
 			&$self.entropy_source, $self.get_peers_for_blinded_path()
+		)?;
+
+		Ok(builder.into())
+	}
+
+	/// Same as [`Self::create_offer_builder`], but every [`Bolt12Invoice`] sent in response to an
+	/// [`InvoiceRequest`] for the offer commits to the given `payment_hash` rather than one derived
+	/// by LDK, as with [`Self::create_inbound_payment_for_hash`].
+	///
+	/// The hash is carried in the offer's [`BlindedMessagePath`] context, so nothing needs to be
+	/// persisted. Since LDK does not know the preimage, the resulting [`PaymentClaimable`] has no
+	/// [`PaymentPurpose::preimage`] and must be claimed via [`Self::claim_funds`] once it is known,
+	/// or failed via [`Self::fail_htlc_backwards`].
+	///
+	/// The offer may be requested more than once, and all invoices will share the payment hash.
+	///
+	/// [`BlindedMessagePath`]: crate::blinded_path::message::BlindedMessagePath
+	/// [`Bolt12Invoice`]: crate::offers::invoice::Bolt12Invoice
+	/// [`InvoiceRequest`]: crate::offers::invoice_request::InvoiceRequest
+	/// [`PaymentClaimable`]: events::Event::PaymentClaimable
+	/// [`PaymentPurpose::preimage`]: events::PaymentPurpose::preimage
+	pub fn create_offer_builder_for_payment_hash(
+		&$self, payment_hash: PaymentHash,
+	) -> Result<$builder, Bolt12SemanticError> {
+		let mut payment_metadata = BTreeMap::new();
+		payment_metadata.insert(OFFER_PAYMENT_HASH_METADATA_KEY, payment_hash.0.to_vec());
+		let builder = $self.flow.create_offer_builder_with_payment_metadata(
+			&$self.entropy_source, $self.get_peers_for_blinded_path(), Some(payment_metadata)
 		)?;
 
 		Ok(builder.into())
@@ -15264,6 +15297,28 @@ impl<
 	pub fn request_refund_payment(
 		&self, refund: &Refund,
 	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
+		self.request_refund_payment_intern(refund, None)
+	}
+
+	/// Same as [`Self::request_refund_payment`], but the [`Bolt12Invoice`] commits to the given
+	/// `payment_hash` rather than one derived by LDK, as with
+	/// [`Self::create_inbound_payment_for_hash`].
+	///
+	/// Since LDK does not know the preimage, the resulting [`PaymentClaimable`] has no
+	/// [`PaymentPurpose::preimage`] and must be claimed via [`Self::claim_funds`] once it is known,
+	/// or failed via [`Self::fail_htlc_backwards`].
+	///
+	/// [`PaymentClaimable`]: events::Event::PaymentClaimable
+	/// [`PaymentPurpose::preimage`]: events::PaymentPurpose::preimage
+	pub fn request_refund_payment_for_hash(
+		&self, refund: &Refund, payment_hash: PaymentHash,
+	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
+		self.request_refund_payment_intern(refund, Some(payment_hash))
+	}
+
+	fn request_refund_payment_intern(
+		&self, refund: &Refund, external_payment_hash: Option<PaymentHash>,
+	) -> Result<Bolt12Invoice, Bolt12SemanticError> {
 		let secp_ctx = &self.secp_ctx;
 		let entropy = &self.entropy_source;
 
@@ -15274,10 +15329,21 @@ impl<
 			entropy,
 			refund,
 			self.list_usable_channels(),
-			|amount_msats, relative_expiry| {
-				self.create_inbound_payment(Some(amount_msats), relative_expiry, None, None)
+			|amount_msats, relative_expiry| match external_payment_hash {
+				Some(payment_hash) => self
+					.create_inbound_payment_for_hash(
+						payment_hash,
+						Some(amount_msats),
+						relative_expiry,
+						None,
+						None,
+					)
 					.map_err(|()| Bolt12SemanticError::InvalidAmount)
-					.map(|(preimage, secret, _no_metadata)| (preimage, secret))
+					.map(|(secret, _no_metadata)| (payment_hash, secret)),
+				None => self
+					.create_inbound_payment(Some(amount_msats), relative_expiry, None, None)
+					.map_err(|()| Bolt12SemanticError::InvalidAmount)
+					.map(|(hash, secret, _no_metadata)| (hash, secret)),
 			},
 			None,
 		)?;
@@ -17519,15 +17585,32 @@ impl<
 					Err(_) => return None,
 				};
 
-				let get_payment_info = |amount_msats, relative_expiry| {
-					self.create_inbound_payment(
-						Some(amount_msats),
-						relative_expiry,
-						None,
-						None,
-					)
-					.map_err(|_| Bolt12SemanticError::InvalidAmount)
-					.map(|(preimage, secret, _no_metadata)| (preimage, secret))
+				let external_payment_hash = match payment_metadata
+					.as_ref()
+					.and_then(|metadata| metadata.get(&OFFER_PAYMENT_HASH_METADATA_KEY))
+				{
+					Some(bytes) => match <[u8; 32]>::try_from(bytes.as_slice()) {
+						Ok(hash) => Some(PaymentHash(hash)),
+						Err(_) => return None,
+					},
+					None => None,
+				};
+
+				let get_payment_info = |amount_msats, relative_expiry| match external_payment_hash {
+					Some(payment_hash) => self
+						.create_inbound_payment_for_hash(
+							payment_hash,
+							Some(amount_msats),
+							relative_expiry,
+							None,
+							None,
+						)
+						.map_err(|_| Bolt12SemanticError::InvalidAmount)
+						.map(|(secret, _no_metadata)| (payment_hash, secret)),
+					None => self
+						.create_inbound_payment(Some(amount_msats), relative_expiry, None, None)
+						.map_err(|_| Bolt12SemanticError::InvalidAmount)
+						.map(|(hash, secret, _no_metadata)| (hash, secret)),
 				};
 
 				let (result, context) = match invoice_request {

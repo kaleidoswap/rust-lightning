@@ -549,7 +549,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	}
 
 	fn create_offer_builder_intern<ES: EntropySource, PF, I>(
-		&self, entropy_source: ES, make_paths: PF,
+		&self, entropy_source: ES, payment_metadata: Option<BTreeMap<u64, Vec<u8>>>, make_paths: PF,
 	) -> Result<(OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError>
 	where
 		PF: FnOnce(
@@ -566,7 +566,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 
 		let nonce = Nonce::from_entropy_source(entropy);
 		let context =
-			MessageContext::Offers(OffersContext::InvoiceRequest { nonce, payment_metadata: None });
+			MessageContext::Offers(OffersContext::InvoiceRequest { nonce, payment_metadata });
 
 		let mut builder =
 			OfferBuilder::deriving_signing_pubkey(node_id, expanded_key, nonce, secp_ctx)
@@ -607,7 +607,19 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	pub fn create_offer_builder<ES: EntropySource>(
 		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
 	) -> Result<OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Bolt12SemanticError> {
-		self.create_offer_builder_intern(&entropy_source, |_, context, _| {
+		self.create_offer_builder_with_payment_metadata(entropy_source, peers, None)
+	}
+
+	/// Same as [`Self::create_offer_builder`], but embeds `payment_metadata` in the context of the
+	/// offer's [`BlindedMessagePath`]. It is handed back via [`OffersContext::InvoiceRequest`] when
+	/// an [`InvoiceRequest`] for the offer arrives, and via [`Bolt12OfferContext`] once paid.
+	///
+	/// This is not exported to bindings users as builder patterns don't map outside of move semantics.
+	pub fn create_offer_builder_with_payment_metadata<ES: EntropySource>(
+		&self, entropy_source: ES, peers: Vec<MessageForwardNode>,
+		payment_metadata: Option<BTreeMap<u64, Vec<u8>>>,
+	) -> Result<OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Bolt12SemanticError> {
+		self.create_offer_builder_intern(&entropy_source, payment_metadata, |_, context, _| {
 			self.create_blinded_paths(peers, context)
 				.map(|paths| paths.into_iter().take(1))
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
@@ -628,7 +640,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		&self, router: ME, entropy_source: ES, peers: Vec<MessageForwardNode>,
 	) -> Result<OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Bolt12SemanticError> {
 		let receive_key = self.get_receive_auth_key();
-		self.create_offer_builder_intern(&entropy_source, |node_id, context, secp_ctx| {
+		self.create_offer_builder_intern(&entropy_source, None, |node_id, context, secp_ctx| {
 			router
 				.create_blinded_paths(node_id, receive_key, context, peers, secp_ctx)
 				.map(|paths| paths.into_iter().take(1))
@@ -650,7 +662,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 	pub fn create_async_receive_offer_builder<ES: EntropySource>(
 		&self, entropy_source: ES, message_paths_to_always_online_node: Vec<BlindedMessagePath>,
 	) -> Result<(OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Nonce), Bolt12SemanticError> {
-		self.create_offer_builder_intern(&entropy_source, |_, _, _| {
+		self.create_offer_builder_intern(&entropy_source, None, |_, _, _| {
 			Ok(message_paths_to_always_online_node)
 		})
 	}
@@ -667,7 +679,7 @@ impl<MR: MessageRouter, L: Logger> OffersMessageFlow<MR, L> {
 		&self, entropy_source: ES, per_node_peers: Vec<(PublicKey, Vec<MessageForwardNode>)>,
 		path_count_limit: usize,
 	) -> Result<OfferBuilder<'_, DerivedMetadata, secp256k1::All>, Bolt12SemanticError> {
-		self.create_offer_builder_intern(entropy_source, |_, context, _| {
+		self.create_offer_builder_intern(entropy_source, None, |_, context, _| {
 			self.blinded_paths_for_phantom_offer(per_node_peers, path_count_limit, context)
 				.map_err(|_| Bolt12SemanticError::MissingPaths)
 		})

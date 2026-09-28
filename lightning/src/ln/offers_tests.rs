@@ -53,6 +53,7 @@ use crate::blinded_path::payment::{Bolt12OfferContext, Bolt12RefundContext, Dumm
 use crate::blinded_path::message::{MessageContext, OffersContext};
 use crate::events::{ClosureReason, Event, HTLCHandlingFailureType, PaidBolt12Invoice, PaymentFailureReason, PaymentPurpose};
 use crate::ln::channelmanager::{PaymentId, RecentPaymentDetails, self};
+use crate::types::payment::{PaymentHash, PaymentPreimage};
 use crate::ln::outbound_payment::{Bolt12PaymentError, RecipientOnionFields, Retry};
 use crate::types::features::Bolt12InvoiceFeatures;
 use crate::ln::functional_test_utils::*;
@@ -2830,4 +2831,177 @@ fn creates_and_verifies_payer_proof_after_offer_payment() {
 		verified.offer_description().map(|desc| desc.to_string()),
 		offer.description().map(|desc| desc.to_string()),
 	);
+}
+
+fn claim_bolt12_payment_for_external_hash<'a, 'b, 'c>(
+	node: &Node<'a, 'b, 'c>, path: &[&Node<'a, 'b, 'c>], payment_preimage: PaymentPreimage,
+	invoice: &Bolt12Invoice,
+) -> PaymentPurpose {
+	let recipient = path.last().expect("Empty path?");
+	let purpose = match get_event!(recipient, Event::PaymentClaimable) {
+		Event::PaymentClaimable { purpose, payment_hash, .. } => {
+			assert_eq!(payment_hash, invoice.payment_hash());
+			purpose
+		},
+		_ => panic!("No Event::PaymentClaimable"),
+	};
+	assert!(purpose.preimage().is_none(), "LDK must not know an externally-chosen preimage");
+
+	let expected_paths = [path];
+	let (inv, _) =
+		claim_payment_along_route(ClaimAlongRouteArgs::new(node, &expected_paths, payment_preimage));
+	assert_eq!(inv, Some(PaidBolt12Invoice::Bolt12Invoice(invoice.clone())));
+	purpose
+}
+
+/// Checks that an offer created for an externally-chosen payment hash answers every invoice
+/// request with that hash, and that the resulting payment is held until claimed with the preimage.
+#[test]
+fn creates_and_pays_for_offer_for_payment_hash() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let payment_preimage = PaymentPreimage([42; 32]);
+	let payment_hash = PaymentHash::from(payment_preimage);
+
+	let offer = alice.node
+		.create_offer_builder_for_payment_hash(payment_hash).unwrap()
+		.amount_msats(10_000_000)
+		.build().unwrap();
+	assert!(!offer.paths().is_empty());
+
+	let payment_id = PaymentId([1; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice.payment_hash(), payment_hash);
+	assert_eq!(invoice.amount_msats(), 10_000_000);
+
+	route_bolt12_payment(bob, &[alice], &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	let purpose = claim_bolt12_payment_for_external_hash(bob, &[alice], payment_preimage, &invoice);
+	match purpose {
+		PaymentPurpose::Bolt12OfferPayment { payment_context, .. } => {
+			assert_eq!(payment_context.offer_id, offer.id());
+			let metadata = payment_context.payment_metadata.expect("hash carried in metadata");
+			assert_eq!(
+				metadata.get(&channelmanager::OFFER_PAYMENT_HASH_METADATA_KEY),
+				Some(&payment_hash.0.to_vec())
+			);
+		},
+		_ => panic!("Unexpected payment purpose: {:?}", purpose),
+	}
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
+}
+
+/// Checks that a payment to an offer created for an externally-chosen payment hash can be failed
+/// back when the preimage never becomes available.
+#[test]
+fn fails_held_payment_for_offer_for_payment_hash() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let payment_hash = PaymentHash::from(PaymentPreimage([7; 32]));
+	let offer = alice.node
+		.create_offer_builder_for_payment_hash(payment_hash).unwrap()
+		.amount_msats(10_000_000)
+		.build().unwrap();
+
+	let payment_id = PaymentId([2; 32]);
+	bob.node.pay_for_offer(&offer, None, payment_id, Default::default()).unwrap();
+
+	let onion_message = bob.onion_messenger.next_onion_message_for_peer(alice_id).unwrap();
+	alice.onion_messenger.handle_onion_message(bob_id, &onion_message);
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice.payment_hash(), payment_hash);
+
+	route_bolt12_payment(bob, &[alice], &invoice);
+	match get_event!(alice, Event::PaymentClaimable) {
+		Event::PaymentClaimable { purpose, .. } => assert!(purpose.preimage().is_none()),
+		_ => panic!("No Event::PaymentClaimable"),
+	}
+
+	alice.node.fail_htlc_backwards(&payment_hash);
+	expect_and_process_pending_htlcs_and_htlc_handling_failed(
+		alice,
+		&[HTLCHandlingFailureType::Receive { payment_hash }],
+	);
+	check_added_monitors(alice, 1);
+	let updates = get_htlc_update_msgs(alice, &bob_id);
+	// Recipients of blinded payments fail back as malformed so as not to reveal their position.
+	assert_eq!(updates.update_fail_malformed_htlcs.len(), 1);
+	bob.node.handle_update_fail_malformed_htlc(alice_id, &updates.update_fail_malformed_htlcs[0]);
+	do_commitment_signed_dance(bob, alice, &updates.commitment_signed, false, false);
+	let events = bob.node.get_and_clear_pending_events();
+	assert!(events.iter().any(|ev| matches!(ev,
+		Event::PaymentPathFailed { payment_hash: hash, .. } if *hash == payment_hash)));
+}
+
+/// Checks that an invoice for a refund can commit to an externally-chosen payment hash.
+#[test]
+fn creates_and_pays_for_refund_for_payment_hash() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 10_000_000, 1_000_000_000);
+
+	let alice = &nodes[0];
+	let alice_id = alice.node.get_our_node_id();
+	let bob = &nodes[1];
+	let bob_id = bob.node.get_our_node_id();
+
+	let absolute_expiry = Duration::from_secs(u64::MAX);
+	let payment_id = PaymentId([1; 32]);
+	let refund = bob.node
+		.create_refund_builder(10_000_000, absolute_expiry, payment_id, Retry::Attempts(0), RouteParametersConfig::default())
+		.unwrap()
+		.build().unwrap();
+
+	let payment_preimage = PaymentPreimage([43; 32]);
+	let payment_hash = PaymentHash::from(payment_preimage);
+	let expected_invoice = alice.node.request_refund_payment_for_hash(&refund, payment_hash).unwrap();
+	assert_eq!(expected_invoice.payment_hash(), payment_hash);
+
+	let onion_message = alice.onion_messenger.next_onion_message_for_peer(bob_id).unwrap();
+	bob.onion_messenger.handle_onion_message(alice_id, &onion_message);
+
+	let (invoice, _) = extract_invoice(bob, &onion_message);
+	assert_eq!(invoice, expected_invoice);
+
+	route_bolt12_payment(bob, &[alice], &invoice);
+	expect_recent_payment!(bob, RecentPaymentDetails::Pending, payment_id);
+
+	let purpose = claim_bolt12_payment_for_external_hash(bob, &[alice], payment_preimage, &invoice);
+	assert!(matches!(purpose, PaymentPurpose::Bolt12RefundPayment { .. }));
+	expect_recent_payment!(bob, RecentPaymentDetails::Fulfilled, payment_id);
 }
