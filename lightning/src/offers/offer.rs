@@ -247,6 +247,7 @@ macro_rules! offer_explicit_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(signing_pubkey),
+					ssps_rails: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -301,6 +302,7 @@ macro_rules! offer_derived_metadata_builder_methods {
 					paths: None,
 					supported_quantity: Quantity::One,
 					issuer_signing_pubkey: Some(node_id),
+					ssps_rails: None,
 					#[cfg(test)]
 					experimental_foo: None,
 				},
@@ -395,6 +397,16 @@ macro_rules! offer_builder_methods { (
 	/// Successive calls to this method will override the previous setting.
 	pub fn supported_quantity($($self_mut)* $self: $self_type, quantity: Quantity) -> $return_type {
 		$self.offer.supported_quantity = quantity;
+		$return_value
+	}
+
+	/// Sets the experimental `ssps_rails` record (type 1000000385): the payment rails the
+	/// issuer accepts, as UTF-8 JSON. It is part of the offer bytes, so it is covered by the
+	/// metadata used to recognise invoice requests for this offer.
+	///
+	/// Successive calls to this method will override the previous setting.
+	pub fn ssps_rails($($self_mut)* $self: $self_type, rails: Vec<u8>) -> $return_type {
+		$self.offer.ssps_rails = Some(rails);
 		$return_value
 	}
 
@@ -632,6 +644,7 @@ pub(super) struct OfferContents {
 	paths: Option<Vec<BlindedMessagePath>>,
 	supported_quantity: Quantity,
 	issuer_signing_pubkey: Option<PublicKey>,
+	ssps_rails: Option<Vec<u8>>,
 	#[cfg(test)]
 	experimental_foo: Option<u64>,
 }
@@ -707,6 +720,11 @@ macro_rules! offer_accessors { ($self: ident, $contents: expr) => {
 	/// [`Bolt12Invoice::signing_pubkey`]: crate::offers::invoice::Bolt12Invoice::signing_pubkey
 	pub fn issuer_signing_pubkey(&$self) -> Option<bitcoin::secp256k1::PublicKey> {
 		$contents.issuer_signing_pubkey()
+	}
+
+	/// The experimental `ssps_rails` record (type 1000000385), if the issuer set one.
+	pub fn ssps_rails(&$self) -> Option<&[u8]> {
+		$contents.ssps_rails()
 	}
 } }
 
@@ -993,6 +1011,10 @@ impl OfferContents {
 		self.issuer_signing_pubkey
 	}
 
+	pub(super) fn ssps_rails(&self) -> Option<&[u8]> {
+		self.ssps_rails.as_deref()
+	}
+
 	pub(super) fn verify_using_metadata<T: secp256k1::Signing>(
 		&self, bytes: &[u8], key: &ExpandedKey, secp_ctx: &Secp256k1<T>,
 	) -> Result<(OfferId, Option<Keypair>), ()> {
@@ -1075,6 +1097,7 @@ impl OfferContents {
 		};
 
 		let experimental_offer = ExperimentalOfferTlvStreamRef {
+			ssps_rails: self.ssps_rails.as_ref(),
 			#[cfg(test)]
 			experimental_foo: self.experimental_foo,
 		};
@@ -1238,17 +1261,19 @@ tlv_stream!(OfferTlvStream, OfferTlvStreamRef<'a>, OFFER_TYPES, {
 pub(super) const EXPERIMENTAL_OFFER_TYPES: core::ops::Range<u64> = 1_000_000_000..2_000_000_000;
 
 #[cfg(not(test))]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(1_000_000_385, ssps_rails: (Vec<u8>, WithoutLength)),
 });
 
 #[cfg(test)]
-tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef, EXPERIMENTAL_OFFER_TYPES, {
+tlv_stream!(ExperimentalOfferTlvStream, ExperimentalOfferTlvStreamRef<'a>, EXPERIMENTAL_OFFER_TYPES, {
+	(1_000_000_385, ssps_rails: (Vec<u8>, WithoutLength)),
 	(1_999_999_999, experimental_foo: (u64, HighZeroBytesDroppedBigSize)),
 });
 
 type FullOfferTlvStream = (OfferTlvStream, ExperimentalOfferTlvStream);
 
-type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef);
+type FullOfferTlvStreamRef<'a> = (OfferTlvStreamRef<'a>, ExperimentalOfferTlvStreamRef<'a>);
 
 impl CursorReadable for FullOfferTlvStream {
 	fn read<R: AsRef<[u8]>>(r: &mut io::Cursor<R>) -> Result<Self, DecodeError> {
@@ -1303,6 +1328,7 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 				issuer_id,
 			},
 			ExperimentalOfferTlvStream {
+				ssps_rails,
 				#[cfg(test)]
 				experimental_foo,
 			},
@@ -1359,6 +1385,7 @@ impl TryFrom<FullOfferTlvStream> for OfferContents {
 			paths,
 			supported_quantity,
 			issuer_signing_pubkey,
+			ssps_rails,
 			#[cfg(test)]
 			experimental_foo,
 		})
@@ -1453,7 +1480,7 @@ mod tests {
 					quantity_max: None,
 					issuer_id: Some(&pubkey(42)),
 				},
-				ExperimentalOfferTlvStreamRef { experimental_foo: None },
+				ExperimentalOfferTlvStreamRef { ssps_rails: None, experimental_foo: None },
 			),
 		);
 
@@ -1576,6 +1603,58 @@ mod tests {
 		let mut encoded_offer = Vec::new();
 		tlv_stream.write(&mut encoded_offer).unwrap();
 
+		let invoice_request = Offer::try_from(encoded_offer)
+			.unwrap()
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		assert!(invoice_request.verify_using_metadata(&expanded_key, &secp_ctx).is_err());
+	}
+
+	#[test]
+	fn builds_offer_with_ssps_rails_and_recognises_its_invoice_requests() {
+		let node_id = recipient_pubkey();
+		let expanded_key = ExpandedKey::new([42; 32]);
+		let entropy = FixedEntropy {};
+		let nonce = Nonce::from_entropy_source(&entropy);
+		let secp_ctx = Secp256k1::new();
+		let payment_id = PaymentId([1; 32]);
+		let rails = br#"["btc:signet","ln"]"#.to_vec();
+
+		#[cfg(c_bindings)]
+		use super::OfferWithDerivedMetadataBuilder as OfferBuilder;
+		let offer = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.ssps_rails(rails.clone())
+			.build()
+			.unwrap();
+		assert_eq!(offer.ssps_rails(), Some(&rails[..]));
+
+		// Survives a round trip through the bech32 string.
+		let parsed = offer.to_string().parse::<Offer>().unwrap();
+		assert_eq!(parsed.ssps_rails(), Some(&rails[..]));
+		assert_eq!(parsed.id(), offer.id());
+
+		let invoice_request = parsed
+			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
+			.unwrap()
+			.build_and_sign()
+			.unwrap();
+		match invoice_request.verify_using_metadata(&expanded_key, &secp_ctx) {
+			Ok(invoice_request) => assert_eq!(invoice_request.offer_id(), offer.id()),
+			Err(_) => panic!("issuer must recognise its offer with ssps_rails"),
+		}
+
+		// Rails added after issuance are not the issuer's: verification fails.
+		let plain = OfferBuilder::deriving_signing_pubkey(node_id, &expanded_key, nonce, &secp_ctx)
+			.amount_msats(1000)
+			.build()
+			.unwrap();
+		let mut tlv_stream = plain.as_tlv_stream();
+		tlv_stream.1.ssps_rails = Some(&rails);
+		let mut encoded_offer = Vec::new();
+		tlv_stream.write(&mut encoded_offer).unwrap();
 		let invoice_request = Offer::try_from(encoded_offer)
 			.unwrap()
 			.request_invoice(&expanded_key, nonce, &secp_ctx, payment_id)
